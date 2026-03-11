@@ -20,3 +20,7 @@ Collects opened applications from gnome-shell extension (app-tracker)
 - Extension for gnome-shell that exposes opened application via D-Bus
 
 - Simple GTK app that displays statistics
+
+### Screenshot
+
+<img width="1476" height="1128" alt="image" src="https://github.com/user-attachments/assets/be768217-5e7c-454d-848c-6f3da3dfa498" />

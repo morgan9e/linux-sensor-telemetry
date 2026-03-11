@@ -1,0 +1,13 @@
+[Unit]
+Description=System Sensor Bridge for D-Bus
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=org.sensord
+ExecStart=/usr/local/bin/sensord
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

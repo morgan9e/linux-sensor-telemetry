@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+"""
+Battery Viewer — GUI for batteryd data
+"""
+
+import sys
+from datetime import date, datetime, timedelta
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+gi.require_version('Gio', '2.0')
+gi.require_version('GLib', '2.0')
+from gi.repository import Gtk, Adw, Gio, GLib, Gdk
+
+DBUS_BUS = 'org.batteryd'
+DBUS_PATH = '/org/batteryd'
+DBUS_IFACE = 'org.batteryd'
+
+STATE_NAMES = {
+    0: 'Unknown', 1: 'Charging', 2: 'Discharging',
+    3: 'Empty', 4: 'Full', 5: 'PendingCharge', 6: 'PendingDischarge',
+}
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f'{seconds}s'
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f'{h}h {m}m'
+    return f'{m}m'
+
+
+# ── D-Bus client ──────────────────────────────────────────
+
+class BatteryClient:
+    def __init__(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+
+    def _call(self, method, args=None, reply_type=None):
+        try:
+            result = self.bus.call_sync(
+                DBUS_BUS, DBUS_PATH, DBUS_IFACE, method,
+                args, GLib.VariantType(reply_type) if reply_type else None,
+                Gio.DBusCallFlags.NONE, -1, None)
+            return result.unpack()
+        except GLib.Error as e:
+            print(f'D-Bus error: {e.message}', file=sys.stderr)
+            return None
+
+    def get_samples(self, date_str):
+        """Returns list of (ts, level, energy_wh, power_w, voltage_v, state)"""
+        r = self._call('GetSamples', GLib.Variant('(s)', (date_str,)),
+                        '(a(dddddd))')
+        return list(r[0]) if r else []
+
+    def get_sessions(self, date_str):
+        """Returns list of (start_ts, end_ts, start_level, end_level, status)"""
+        r = self._call('GetSessions', GLib.Variant('(s)', (date_str,)),
+                        '(a(dddds))')
+        return list(r[0]) if r else []
+
+    def get_current(self):
+        r = self._call('GetCurrent', None, '(dddds)')
+        if r:
+            return {'level': r[0], 'energy_wh': r[1],
+                    'power_w': r[2], 'voltage_v': r[3], 'status': r[4]}
+        return None
+
+
+# ── Level + Energy chart ──────────────────────────────────
+
+class BatteryChart(Gtk.DrawingArea):
+    def __init__(self):
+        super().__init__()
+        self.samples = []
+        self.day_start = 0
+        self.set_content_height(200)
+        self.set_draw_func(self._draw)
+
+        self.set_has_tooltip(True)
+        motion = Gtk.EventControllerMotion()
+        motion.connect('motion', self._on_motion)
+        motion.connect('leave', lambda c: self.set_tooltip_markup(None))
+        self.add_controller(motion)
+
+    def set_data(self, samples, day_start):
+        self.samples = samples
+        self.day_start = day_start
+        self.queue_draw()
+
+    def _on_motion(self, ctrl, x, y):
+        if not self.samples or not self.day_start:
+            self.set_tooltip_markup(None)
+            return
+
+        width = self.get_width()
+        margin_l, margin_r = 40, 48
+        cw = width - margin_l - margin_r
+        if cw <= 0:
+            return
+
+        frac = (x - margin_l) / cw
+        if frac < 0 or frac > 1:
+            self.set_tooltip_markup(None)
+            return
+
+        t_min, t_max = self._time_range()
+        target_ts = t_min + frac * (t_max - t_min)
+
+        best = min(self.samples, key=lambda s: abs(s[0] - target_ts))
+        if abs(best[0] - target_ts) > 600:
+            self.set_tooltip_markup(None)
+            return
+
+        ts, level, energy, power, voltage, state = best
+        t = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
+        status = STATE_NAMES.get(int(state), '?')
+        self.set_tooltip_markup(
+            f'<b>{t}</b>\n'
+            f'{level:.1f}%  ·  {energy:.2f} Wh\n'
+            f'{power:.1f} W  ·  {voltage:.2f} V  ·  {status}')
+
+    def _time_range(self):
+        """Compute time axis range: fit to data with padding, snap to hours."""
+        if not self.samples:
+            return self.day_start, self.day_start + 86400
+
+        first_ts = self.samples[0][0]
+        last_ts = self.samples[-1][0]
+        span = last_ts - first_ts
+
+        # pad 10% on each side, minimum 10 min
+        pad = max(span * 0.1, 600)
+        t_min = first_ts - pad
+        t_max = last_ts + pad
+
+        # snap to hour boundaries
+        t_min = t_min - (t_min % 3600)
+        t_max = t_max + (3600 - t_max % 3600) if t_max % 3600 else t_max
+
+        # clamp to day
+        day_end = self.day_start + 86400
+        t_min = max(t_min, self.day_start)
+        t_max = min(t_max, day_end)
+
+        return t_min, t_max
+
+    def _draw(self, area, cr, width, height):
+        if len(self.samples) < 2:
+            fg = self.get_color()
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.3)
+            cr.set_font_size(12)
+            cr.move_to(width / 2 - 40, height / 2)
+            cr.show_text('No data yet')
+            return
+
+        ml, mr, mt, mb = 40, 48, 12, 24
+        cw = width - ml - mr
+        ch = height - mt - mb
+
+        fg = self.get_color()
+        t_min, t_max = self._time_range()
+        t_span = t_max - t_min
+
+        energies = [s[2] for s in self.samples]
+        e_min = min(energies)
+        e_max = max(energies)
+        if e_max <= e_min:
+            e_max = e_min + 1
+
+        def tx(ts):
+            return ml + ((ts - t_min) / t_span) * cw
+
+        def ty_pct(pct):
+            return mt + (1 - pct / 100) * ch
+
+        def ty_energy(e):
+            return mt + (1 - (e - e_min) / (e_max - e_min)) * ch
+
+        # background grid — horizontal
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.06)
+        cr.set_line_width(0.5)
+        for pct in (25, 50, 75):
+            y = ty_pct(pct)
+            cr.move_to(ml, y)
+            cr.line_to(width - mr, y)
+            cr.stroke()
+
+        # vertical grid — pick interval based on span
+        hours_span = t_span / 3600
+        if hours_span <= 2:
+            tick_secs = 900     # 15 min
+        elif hours_span <= 6:
+            tick_secs = 1800    # 30 min
+        elif hours_span <= 12:
+            tick_secs = 3600    # 1 hour
+        else:
+            tick_secs = 3 * 3600  # 3 hours
+
+        # first tick aligned to interval
+        first_tick = t_min - (t_min % tick_secs) + tick_secs
+        t = first_tick
+        while t < t_max:
+            x = tx(t)
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.06)
+            cr.move_to(x, mt)
+            cr.line_to(x, mt + ch)
+            cr.stroke()
+            t += tick_secs
+
+        # charging regions (green tint)
+        for i in range(len(self.samples) - 1):
+            s0, s1 = self.samples[i], self.samples[i + 1]
+            if int(s0[5]) == 1:  # Charging (state is now index 5)
+                x1 = max(ml, tx(s0[0]))
+                x2 = min(width - mr, tx(s1[0]))
+                cr.set_source_rgba(0.3, 0.8, 0.3, 0.06)
+                cr.rectangle(x1, mt, x2 - x1, ch)
+                cr.fill()
+
+        # percentage line (blue)
+        cr.set_source_rgba(0.2, 0.6, 1.0, 0.9)
+        cr.set_line_width(1.5)
+        for i, s in enumerate(self.samples):
+            x = tx(s[0])
+            y = ty_pct(s[1])
+            if i == 0:
+                cr.move_to(x, y)
+            else:
+                cr.line_to(x, y)
+        cr.stroke()
+
+        # energy line (orange)
+        cr.set_source_rgba(1.0, 0.6, 0.2, 0.7)
+        cr.set_line_width(1)
+        for i, s in enumerate(self.samples):
+            x = tx(s[0])
+            y = ty_energy(s[2])
+            if i == 0:
+                cr.move_to(x, y)
+            else:
+                cr.line_to(x, y)
+        cr.stroke()
+
+        # left axis: percentage
+        cr.set_source_rgba(0.2, 0.6, 1.0, 0.6)
+        cr.set_font_size(9)
+        for pct in (0, 25, 50, 75, 100):
+            y = ty_pct(pct) + 3
+            cr.move_to(4, y)
+            cr.show_text(f'{pct}%')
+
+        # right axis: energy Wh
+        cr.set_source_rgba(1.0, 0.6, 0.2, 0.6)
+        for i in range(5):
+            e = e_min + (e_max - e_min) * i / 4
+            y = ty_energy(e) + 3
+            cr.move_to(width - mr + 6, y)
+            cr.show_text(f'{e:.0f}Wh')
+
+        # bottom axis labels
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.4)
+        cr.set_font_size(9)
+        t = first_tick
+        while t < t_max:
+            x = tx(t)
+            label = datetime.fromtimestamp(t).strftime('%H:%M')
+            cr.move_to(x - 12, height - 6)
+            cr.show_text(label)
+            t += tick_secs
+
+
+# ── Power chart ───────────────────────────────────────────
+
+class PowerChart(Gtk.DrawingArea):
+    def __init__(self):
+        super().__init__()
+        self.samples = []
+        self.day_start = 0
+        self.set_content_height(90)
+        self.set_draw_func(self._draw)
+
+        self.set_has_tooltip(True)
+        motion = Gtk.EventControllerMotion()
+        motion.connect('motion', self._on_motion)
+        motion.connect('leave', lambda c: self.set_tooltip_markup(None))
+        self.add_controller(motion)
+
+    def set_data(self, samples, day_start):
+        self.samples = samples
+        self.day_start = day_start
+        self.queue_draw()
+
+    def _time_range(self):
+        if not self.samples:
+            return self.day_start, self.day_start + 86400
+        first_ts = self.samples[0][0]
+        last_ts = self.samples[-1][0]
+        span = last_ts - first_ts
+        pad = max(span * 0.1, 600)
+        t_min = first_ts - pad
+        t_max = last_ts + pad
+        t_min = t_min - (t_min % 3600)
+        t_max = t_max + (3600 - t_max % 3600) if t_max % 3600 else t_max
+        day_end = self.day_start + 86400
+        t_min = max(t_min, self.day_start)
+        t_max = min(t_max, day_end)
+        return t_min, t_max
+
+    def _on_motion(self, ctrl, x, y):
+        if not self.samples:
+            self.set_tooltip_markup(None)
+            return
+
+        ml, mr = 40, 12
+        cw = self.get_width() - ml - mr
+        if cw <= 0:
+            return
+
+        frac = (x - ml) / cw
+        if frac < 0 or frac > 1:
+            self.set_tooltip_markup(None)
+            return
+
+        t_min, t_max = self._time_range()
+        target_ts = t_min + frac * (t_max - t_min)
+        best = min(self.samples, key=lambda s: abs(s[0] - target_ts))
+        if abs(best[0] - target_ts) > 600:
+            self.set_tooltip_markup(None)
+            return
+
+        t = datetime.fromtimestamp(best[0]).strftime('%H:%M:%S')
+        self.set_tooltip_markup(f'<b>{t}</b>\n{best[3]:.2f} W')
+
+    def _draw(self, area, cr, width, height):
+        if len(self.samples) < 2:
+            return
+
+        ml, mr, mt, mb = 40, 12, 8, 8
+        cw = width - ml - mr
+        ch = height - mt - mb
+
+        t_min, t_max = self._time_range()
+        t_span = t_max - t_min
+
+        powers = [s[3] for s in self.samples]
+        p_max = max(max(powers), 0.1)
+
+        def tx(ts):
+            return ml + ((ts - t_min) / t_span) * cw
+
+        def ty(pw):
+            return mt + (1 - pw / p_max) * ch
+
+        # filled area
+        cr.set_source_rgba(0.9, 0.3, 0.3, 0.12)
+        cr.move_to(tx(self.samples[0][0]), mt + ch)
+        for s in self.samples:
+            cr.line_to(tx(s[0]), ty(s[3]))
+        cr.line_to(tx(self.samples[-1][0]), mt + ch)
+        cr.close_path()
+        cr.fill()
+
+        # line
+        cr.set_source_rgba(0.9, 0.3, 0.3, 0.8)
+        cr.set_line_width(1)
+        for i, s in enumerate(self.samples):
+            x, y = tx(s[0]), ty(s[3])
+            if i == 0:
+                cr.move_to(x, y)
+            else:
+                cr.line_to(x, y)
+        cr.stroke()
+
+        # axis
+        fg = self.get_color()
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.4)
+        cr.set_font_size(9)
+        cr.move_to(4, mt + 10)
+        cr.show_text(f'{p_max:.1f}W')
+        cr.move_to(4, mt + ch)
+        cr.show_text('0W')
+
+
+# ── Session row ───────────────────────────────────────────
+
+class SessionRow(Adw.ActionRow):
+    def __init__(self, start_ts, end_ts, start_level, end_level, status):
+        super().__init__()
+
+        t_start = datetime.fromtimestamp(start_ts).strftime('%H:%M')
+        t_end = datetime.fromtimestamp(end_ts).strftime('%H:%M')
+        duration = end_ts - start_ts
+
+        if status == 'Discharging':
+            icon = 'battery-level-50-symbolic'
+            arrow = '↓'
+        elif status == 'Charging':
+            icon = 'battery-level-50-charging-symbolic'
+            arrow = '↑'
+        else:
+            icon = 'battery-level-100-symbolic'
+            arrow = '→'
+
+        self.set_title(status)
+        self.set_subtitle(f'{t_start} – {t_end}  ·  {format_duration(duration)}')
+
+        img = Gtk.Image.new_from_icon_name(icon)
+        img.set_pixel_size(24)
+        self.add_prefix(img)
+
+        label = Gtk.Label()
+        label.set_markup(f'{start_level:.0f}% {arrow} {end_level:.0f}%')
+        label.add_css_class('caption')
+        label.set_valign(Gtk.Align.CENTER)
+        self.add_suffix(label)
+
+
+# ── Main window ───────────────────────────────────────────
+
+class BatteryWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title='Battery',
+                         default_width=460, default_height=650)
+
+        self.client = BatteryClient()
+        self.current_date = date.today()
+
+        css = Gtk.CssProvider()
+        css.load_from_string('''
+            .big-level { font-size: 2em; font-weight: 800; }
+            .legend-level {
+                background: rgba(51,153,255,0.9);
+                border-radius: 2px; min-width: 10px; min-height: 10px;
+            }
+            .legend-energy {
+                background: rgba(255,153,51,0.7);
+                border-radius: 2px; min-width: 10px; min-height: 10px;
+            }
+            .legend-power {
+                background: rgba(230,77,77,0.7);
+                border-radius: 2px; min-width: 10px; min-height: 10px;
+            }
+        ''')
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        toolbar.add_top_bar(header)
+
+        # nav
+        nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        nav.set_halign(Gtk.Align.CENTER)
+        prev_btn = Gtk.Button(icon_name='go-previous-symbolic')
+        prev_btn.connect('clicked', lambda _: self._change_date(-1))
+        nav.append(prev_btn)
+        self.date_label = Gtk.Label()
+        self.date_label.add_css_class('title-4')
+        nav.append(self.date_label)
+        next_btn = Gtk.Button(icon_name='go-next-symbolic')
+        next_btn.connect('clicked', lambda _: self._change_date(1))
+        nav.append(next_btn)
+        header.set_title_widget(nav)
+
+        # content
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.content.set_margin_start(16)
+        self.content.set_margin_end(16)
+        self.content.set_margin_top(16)
+        self.content.set_margin_bottom(16)
+        scroll.set_child(self.content)
+        toolbar.set_content(scroll)
+
+        # current
+        self.status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.status_box.set_halign(Gtk.Align.CENTER)
+        self.status_box.set_margin_bottom(16)
+        self.level_label = Gtk.Label()
+        self.level_label.add_css_class('big-level')
+        self.status_box.append(self.level_label)
+        self.status_sub = Gtk.Label()
+        self.status_sub.add_css_class('dim-label')
+        self.status_box.append(self.status_sub)
+        self.content.append(self.status_box)
+
+        # level chart + legend
+        chart_group = Adw.PreferencesGroup(title='Battery Level')
+        legend = Gtk.Box(spacing=12)
+        legend.set_halign(Gtk.Align.END)
+        for css_cls, text in [('legend-level', 'Level %'), ('legend-energy', 'Energy Wh')]:
+            item = Gtk.Box(spacing=4)
+            dot = Gtk.Box()
+            dot.set_size_request(10, 10)
+            dot.set_valign(Gtk.Align.CENTER)
+            dot.add_css_class(css_cls)
+            item.append(dot)
+            lbl = Gtk.Label(label=text)
+            lbl.add_css_class('caption')
+            lbl.add_css_class('dim-label')
+            item.append(lbl)
+            legend.append(item)
+        chart_group.set_header_suffix(legend)
+        self.chart = BatteryChart()
+        chart_group.add(self.chart)
+        self.content.append(chart_group)
+
+        # power chart
+        power_group = Adw.PreferencesGroup(title='Power Draw')
+        power_group.set_margin_top(16)
+        self.power_chart = PowerChart()
+        power_group.add(self.power_chart)
+        self.content.append(power_group)
+
+        # sessions
+        self.session_group = Adw.PreferencesGroup(title='Sessions')
+        self.session_group.set_margin_top(16)
+        self.content.append(self.session_group)
+
+        self.set_content(toolbar)
+        self._refresh()
+
+    def _change_date(self, delta):
+        self.current_date += timedelta(days=delta)
+        self._refresh()
+
+    def _refresh(self):
+        date_str = self.current_date.isoformat()
+
+        if self.current_date == date.today():
+            self.date_label.set_label('Today')
+        elif self.current_date == date.today() - timedelta(days=1):
+            self.date_label.set_label('Yesterday')
+        else:
+            self.date_label.set_label(
+                self.current_date.strftime('%a, %b %-d'))
+
+        samples = self.client.get_samples(date_str)
+        sessions = self.client.get_sessions(date_str)
+        day_start = datetime.combine(
+            self.current_date, datetime.min.time()).timestamp()
+
+        # current (today only)
+        if self.current_date == date.today():
+            cur = self.client.get_current()
+            if cur:
+                self.level_label.set_label(f'{cur["level"]:.0f}%')
+                self.status_sub.set_label(
+                    f'{cur["energy_wh"]:.1f} Wh  ·  '
+                    f'{cur["power_w"]:.1f} W  ·  '
+                    f'{cur["voltage_v"]:.2f} V  ·  {cur["status"]}')
+                self.status_box.set_visible(True)
+            else:
+                self.status_box.set_visible(False)
+        else:
+            self.status_box.set_visible(False)
+
+        # charts
+        self.chart.set_data(samples, day_start)
+        self.power_chart.set_data(samples, day_start)
+
+        # sessions list
+        self.content.remove(self.session_group)
+        self.session_group = Adw.PreferencesGroup(title='Sessions')
+        self.session_group.set_margin_top(16)
+        self.content.append(self.session_group)
+
+        for s in sessions:
+            start_ts, end_ts, start_lvl, end_lvl, status = s
+            if end_ts - start_ts < 30:
+                continue
+            row = SessionRow(start_ts, end_ts, start_lvl, end_lvl, status)
+            self.session_group.add(row)
+
+        if not sessions:
+            empty = Adw.ActionRow(title='No sessions recorded')
+            empty.add_css_class('dim-label')
+            self.session_group.add(empty)
+
+
+# ── App ───────────────────────────────────────────────────
+
+class BatteryApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id='org.batteryd.Viewer')
+
+    def do_activate(self):
+        win = self.get_active_window()
+        if not win:
+            win = BatteryWindow(self)
+        win.present()
+
+
+if __name__ == '__main__':
+    app = BatteryApp()
+    app.run(sys.argv)

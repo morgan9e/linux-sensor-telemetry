@@ -1,0 +1,13 @@
+[Unit]
+Description=Screen Time Tracking Daemon
+After=gnome-shell.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/screentimed
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

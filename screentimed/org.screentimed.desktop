@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=ScreenTime
+Comment=View your screen time usage
+Exec=screentime-viewer
+Icon=preferences-system-time-symbolic
+Type=Application
+Categories=GNOME;GTK;Utility;

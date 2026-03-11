@@ -1,0 +1,7 @@
+{
+  "uuid": "app-tracker@local",
+  "name": "Application Tracker",
+  "description": "Exposes active app over D-Bus",
+  "shell-version": ["48", "49", "50"],
+  "version": 1
+}

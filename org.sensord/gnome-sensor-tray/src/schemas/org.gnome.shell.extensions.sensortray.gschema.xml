@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+
+  <schema id="org.gnome.shell.extensions.sensortray"
+          path="/org/gnome/shell/extensions/sensortray/">
+
+    <key name="hot-sensors" type="as">
+      <default>[]</default>
+      <summary>Sensors pinned to the panel</summary>
+      <description>Ordered list of sensor keys shown in the top bar (e.g. "Thermal/coretemp/Core 0", "Cpu/total")</description>
+    </key>
+
+    <key name="position-in-panel" type="i">
+      <default>2</default>
+      <summary>Panel position (0=left, 1=center, 2=right)</summary>
+    </key>
+
+    <key name="panel-box-index" type="i">
+      <default>0</default>
+      <summary>Index within the panel box</summary>
+    </key>
+
+    <key name="show-icon-on-panel" type="b">
+      <default>true</default>
+      <summary>Show icon next to each pinned sensor value</summary>
+    </key>
+
+    <key name="unit" type="i">
+      <default>0</default>
+      <summary>Temperature unit (0=Celsius, 1=Fahrenheit)</summary>
+    </key>
+
+    <key name="show-decimal-value" type="b">
+      <default>false</default>
+      <summary>Show one decimal place</summary>
+    </key>
+
+    <key name="panel-spacing" type="i">
+      <default>8</default>
+      <summary>Spacing between pinned values in pixels</summary>
+    </key>
+
+    <key name="update-interval" type="i">
+      <default>1</default>
+      <summary>Seconds between UI updates (1–10)</summary>
+      <description>How many seconds between panel and menu repaints. D-Bus signals still arrive immediately; only the visual repaint is throttled.</description>
+      <range min="1" max="10"/>
+    </key>
+
+  </schema>
+
+</schemalist>

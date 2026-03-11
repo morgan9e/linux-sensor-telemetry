@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Battery
+Comment=View battery usage history
+Exec=battery-viewer
+Icon=battery-level-50-symbolic
+Type=Application
+Categories=GNOME;GTK;Utility;System;

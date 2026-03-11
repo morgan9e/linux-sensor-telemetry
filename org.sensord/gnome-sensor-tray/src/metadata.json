@@ -1,0 +1,8 @@
+{
+  "uuid": "sensor-tray@local",
+  "name": "Sensor Tray",
+  "description": "System sensor monitor powered by sensord. Displays CPU, thermal, power, and memory readings from org.sensord D-Bus interfaces.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "settings-schema": "org.gnome.shell.extensions.sensortray",
+  "url": ""
+}

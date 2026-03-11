@@ -1,0 +1,436 @@
+#!/usr/bin/python3 -sP
+
+import sys
+from datetime import date, timedelta
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+gi.require_version('Gio', '2.0')
+gi.require_version('GLib', '2.0')
+try:
+    gi.require_version('GioUnix', '2.0')
+    from gi.repository import GioUnix
+    _DesktopAppInfo = GioUnix.DesktopAppInfo
+except (ValueError, ImportError):
+    from gi.repository import Gio as _Gio
+    _DesktopAppInfo = _Gio.DesktopAppInfo
+from gi.repository import Gtk, Adw, Gio, GLib, Gdk
+
+SCREENTIMED_BUS = 'org.gnome.ScreenTime'
+SCREENTIMED_PATH = '/org/gnome/ScreenTime'
+SCREENTIMED_IFACE = 'org.gnome.ScreenTime'
+
+
+def format_duration(seconds):
+    if seconds < 60:
+        return f'{seconds}s'
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f'{h}h {m}m'
+    return f'{m}m'
+
+
+def get_app_info(app_id):
+    """Return (display_name, icon) from .desktop file, with fallbacks."""
+    if not app_id.endswith('.desktop'):
+        return None, None  # not a real app
+    try:
+        info = _DesktopAppInfo.new(app_id)
+        if info:
+            name = info.get_display_name() or info.get_name()
+            icon = info.get_icon()
+            return name, icon
+    except Exception:
+        pass
+    name = app_id.replace('.desktop', '').split('.')[-1]
+    return name, None
+
+
+def merge_unknown(usage):
+    """Collapse entries without .desktop into a single 'Unknown' entry."""
+    merged = {}
+    unknown = 0
+    for app_id, secs in usage.items():
+        if app_id.endswith('.desktop'):
+            merged[app_id] = secs
+        else:
+            unknown += secs
+    if unknown:
+        merged['__unknown__'] = unknown
+    return merged
+
+
+# ── D-Bus client ──────────────────────────────────────────
+
+class ScreenTimeClient:
+    def __init__(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+
+    def _call(self, method, args=None, reply_type=None):
+        try:
+            result = self.bus.call_sync(
+                SCREENTIMED_BUS, SCREENTIMED_PATH, SCREENTIMED_IFACE,
+                method,
+                args, GLib.VariantType(reply_type) if reply_type else None,
+                Gio.DBusCallFlags.NONE, -1, None)
+            return result.unpack()
+        except GLib.Error as e:
+            print(f'D-Bus error: {e.message}', file=sys.stderr)
+            return None
+
+    def get_usage(self, date_str):
+        r = self._call('GetUsage', GLib.Variant('(s)', (date_str,)),
+                        '(a{su}a{su})')
+        if r:
+            return dict(r[0]), dict(r[1])
+        return {}, {}
+
+    def get_usage_by_hour(self, date_str):
+        r = self._call('GetUsageByHour', GLib.Variant('(s)', (date_str,)),
+                        '(aa{su}aa{su})')
+        if r:
+            return [dict(h) for h in r[0]], [dict(h) for h in r[1]]
+        return [{} for _ in range(24)], [{} for _ in range(24)]
+
+
+# ── Hourly bar chart ──────────────────────────────────────
+
+class HourlyChart(Gtk.DrawingArea):
+    def __init__(self):
+        super().__init__()
+        self.focused_hours = [{} for _ in range(24)]
+        self.running_hours = [{} for _ in range(24)]
+        self.set_content_height(110)
+        self.set_draw_func(self._draw)
+
+        self.set_has_tooltip(True)
+        self.connect('query-tooltip', self._on_tooltip)
+
+    def set_data(self, focused_hours, running_hours):
+        self.focused_hours = focused_hours
+        self.running_hours = running_hours
+        self.queue_draw()
+
+    def _on_tooltip(self, widget, x, y, keyboard, tooltip):
+        width = self.get_width()
+        h = int((x / width) * 24)
+        h = max(0, min(23, h))
+
+        focused = self.focused_hours[h]
+        running = self.running_hours[h]
+
+        if not sum(focused.values()) and not sum(running.values()):
+            return False
+
+        lines = [f'<b>{h:02d}:00 – {h + 1:02d}:00</b>']
+
+        all_apps = set(focused.keys()) | set(running.keys())
+        sorted_apps = sorted(all_apps,
+                              key=lambda a: focused.get(a, 0),
+                              reverse=True)
+        for app_id in sorted_apps[:6]:
+            f = focused.get(app_id, 0)
+            r = running.get(app_id, 0)
+            if app_id.endswith('.desktop'):
+                name, _ = get_app_info(app_id)
+                name = name or app_id
+            else:
+                name = 'Unknown'
+            if r > f + 30:
+                lines.append(f'{name}: {format_duration(f)} / {format_duration(r)}')
+            elif f:
+                lines.append(f'{name}: {format_duration(f)}')
+            elif r:
+                lines.append(f'{name}: running {format_duration(r)}')
+
+        tooltip.set_markup('\n'.join(lines))
+        return True
+
+    def _get_colors(self):
+        """Get accent and foreground RGBA for Cairo drawing."""
+        fg = self.get_color()  # GTK4.10+
+
+        # try Adw 1.6+ accent API
+        accent = None
+        try:
+            sm = Adw.StyleManager.get_default()
+            ac = sm.get_accent_color()
+            accent = ac.to_rgba(sm.get_dark())
+        except (AttributeError, TypeError):
+            pass
+
+        if accent is None:
+            accent = Gdk.RGBA()
+            accent.parse('#3584e4')
+
+        return accent, fg
+
+    def _draw(self, area, cr, width, height):
+        f_totals = [sum(h.values()) for h in self.focused_hours]
+        r_totals = [sum(h.values()) for h in self.running_hours]
+        peak = max(max(r_totals), max(f_totals), 1)
+
+        bar_w = width / 24
+        pad = 2
+        label_h = 14
+        chart_h = height - label_h
+
+        accent, fg = self._get_colors()
+
+        # running bars
+        cr.set_source_rgba(accent.red, accent.green, accent.blue, 0.2)
+
+        for i, total in enumerate(r_totals):
+            if total == 0:
+                continue
+            bar_h = (total / peak) * (chart_h - 4)
+            cr.rectangle(i * bar_w + pad, chart_h - bar_h,
+                         bar_w - pad * 2, bar_h)
+            cr.fill()
+
+        # focused bars
+        cr.set_source_rgba(accent.red, accent.green, accent.blue, 0.85)
+
+        for i, total in enumerate(f_totals):
+            if total == 0:
+                continue
+            bar_h = (total / peak) * (chart_h - 4)
+            cr.rectangle(i * bar_w + pad, chart_h - bar_h,
+                         bar_w - pad * 2, bar_h)
+            cr.fill()
+
+        # labels
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.5)
+        cr.set_font_size(9)
+        for i in (0, 6, 12, 18):
+            cr.move_to(i * bar_w + bar_w / 2 - 6, height - 2)
+            cr.show_text(f'{i:02d}')
+
+
+# ── App usage row ─────────────────────────────────────────
+
+class AppUsageRow(Adw.ActionRow):
+    def __init__(self, app_id, focused_secs, running_secs, max_running):
+        super().__init__()
+
+        if app_id == '__unknown__':
+            name = 'Unknown'
+            icon = None
+            self.set_subtitle('Apps without .desktop entries')
+        else:
+            name, icon = get_app_info(app_id)
+            self.set_subtitle(app_id)
+
+        self.set_title(name or app_id)
+
+        if icon:
+            img = Gtk.Image.new_from_gicon(icon)
+            img.set_pixel_size(32)
+            self.add_prefix(img)
+        else:
+            img = Gtk.Image.new_from_icon_name('application-x-executable-symbolic')
+            img.set_pixel_size(32)
+            self.add_prefix(img)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_valign(Gtk.Align.CENTER)
+
+        BAR_W = 100
+        r_frac = min(1.0, running_secs / max_running) if max_running else 0
+        f_frac = min(1.0, focused_secs / max_running) if max_running else 0
+
+        bar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        bar_box.set_size_request(BAR_W, -1)
+
+        f_bar = Gtk.Box()
+        f_bar.set_size_request(max(2, int(BAR_W * f_frac)), 6)
+        f_bar.set_halign(Gtk.Align.START)
+        f_bar.add_css_class('usage-bar-focused')
+        bar_box.append(f_bar)
+
+        if running_secs > focused_secs + 30:
+            r_bar = Gtk.Box()
+            r_bar.set_size_request(max(2, int(BAR_W * r_frac)), 4)
+            r_bar.set_halign(Gtk.Align.START)
+            r_bar.add_css_class('usage-bar-running')
+            bar_box.append(r_bar)
+
+        box.append(bar_box)
+
+        label_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        f_label = Gtk.Label(label=format_duration(focused_secs))
+        f_label.add_css_class('caption')
+        label_box.append(f_label)
+
+        if running_secs > focused_secs + 30:
+            r_label = Gtk.Label(label=f'/ {format_duration(running_secs)}')
+            r_label.add_css_class('caption')
+            r_label.add_css_class('dim-label')
+            label_box.append(r_label)
+
+        box.append(label_box)
+        self.add_suffix(box)
+
+
+# ── Main window ───────────────────────────────────────────
+
+class ScreenTimeWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title='Screen Time',
+                         default_width=420, default_height=600)
+
+        self.client = ScreenTimeClient()
+        self.current_date = date.today()
+
+        css = Gtk.CssProvider()
+        css.load_from_string('''
+            .usage-bar-focused {
+                background: @accent_bg_color;
+                border-radius: 3px;
+                min-height: 6px;
+            }
+            .usage-bar-running {
+                background: alpha(@accent_bg_color, 0.3);
+                border-radius: 3px;
+                min-height: 4px;
+            }
+            .total-time {
+                font-size: 2em;
+                font-weight: 800;
+            }
+        ''')
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        toolbar.add_top_bar(header)
+
+        # navigation
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        nav_box.set_halign(Gtk.Align.CENTER)
+
+        prev_btn = Gtk.Button(icon_name='go-previous-symbolic')
+        prev_btn.connect('clicked', lambda _: self._change_date(-1))
+        nav_box.append(prev_btn)
+
+        self.date_label = Gtk.Label()
+        self.date_label.add_css_class('title-4')
+        nav_box.append(self.date_label)
+
+        next_btn = Gtk.Button(icon_name='go-next-symbolic')
+        next_btn.connect('clicked', lambda _: self._change_date(1))
+        nav_box.append(next_btn)
+
+        header.set_title_widget(nav_box)
+
+        # content
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.content.set_margin_start(16)
+        self.content.set_margin_end(16)
+        self.content.set_margin_top(16)
+        self.content.set_margin_bottom(16)
+        scroll.set_child(self.content)
+        toolbar.set_content(scroll)
+
+        # total
+        self.total_label = Gtk.Label()
+        self.total_label.add_css_class('total-time')
+        self.total_label.set_margin_bottom(4)
+        self.content.append(self.total_label)
+
+        self.total_sub = Gtk.Label()
+        self.total_sub.add_css_class('dim-label')
+        self.total_sub.set_margin_bottom(16)
+        self.content.append(self.total_sub)
+
+        # hourly chart
+        hr_group = Adw.PreferencesGroup(title='Hourly')
+        self.hourly = HourlyChart()
+        hr_group.add(self.hourly)
+        self.content.append(hr_group)
+
+        # app list
+        self.app_group = Adw.PreferencesGroup(title='Apps')
+        self.app_group.set_margin_top(16)
+        self.content.append(self.app_group)
+
+        self.set_content(toolbar)
+        self._refresh()
+
+    def _change_date(self, delta):
+        self.current_date += timedelta(days=delta)
+        self._refresh()
+
+    def _refresh(self):
+        date_str = self.current_date.isoformat()
+
+        if self.current_date == date.today():
+            self.date_label.set_label('Today')
+        elif self.current_date == date.today() - timedelta(days=1):
+            self.date_label.set_label('Yesterday')
+        else:
+            self.date_label.set_label(
+                self.current_date.strftime('%a, %b %-d'))
+
+        focused, running = self.client.get_usage(date_str)
+        focused = merge_unknown(focused)
+        running = merge_unknown(running)
+        f_hours, r_hours = self.client.get_usage_by_hour(date_str)
+
+        # totals
+        total_focused = sum(focused.values())
+        total_running = sum(running.values())
+        self.total_label.set_label(format_duration(total_focused))
+        if total_running > total_focused + 60:
+            self.total_sub.set_label(
+                f'{format_duration(total_running)} total running')
+            self.total_sub.set_visible(True)
+        else:
+            self.total_sub.set_visible(False)
+
+        # hourly
+        self.hourly.set_data(f_hours, r_hours)
+
+        # app list
+        self.content.remove(self.app_group)
+        self.app_group = Adw.PreferencesGroup(title='Apps')
+        self.app_group.set_margin_top(16)
+        self.content.append(self.app_group)
+
+        all_apps = set(focused.keys()) | set(running.keys())
+        sorted_apps = sorted(all_apps,
+                              key=lambda a: focused.get(a, 0),
+                              reverse=True)
+        max_running = max(running.values()) if running else 1
+
+        for app_id in sorted_apps:
+            f = focused.get(app_id, 0)
+            r = running.get(app_id, 0)
+            if r < 1 and f < 1:
+                continue
+            row = AppUsageRow(app_id, f, r, max_running)
+            self.app_group.add(row)
+
+
+# ── App ───────────────────────────────────────────────────
+
+class ScreenTimeApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id='org.gnome.ScreenTime.Viewer')
+
+    def do_activate(self):
+        win = self.get_active_window()
+        if not win:
+            win = ScreenTimeWindow(self)
+        win.present()
+
+
+if __name__ == '__main__':
+    app = ScreenTimeApp()
+    app.run(sys.argv)

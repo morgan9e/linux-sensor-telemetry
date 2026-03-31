@@ -334,15 +334,18 @@ class Daemon:
         self.bus = None
         self.sensors = {}     # name → sensor instance
         self.readings = {}    # name → latest {key: value}
+        self.pending = {}     # name → (cls, interval) — not yet available
         self.node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
 
-        for name, (cls, _) in SENSORS.items():
+        for name, (cls, interval) in SENSORS.items():
             sensor = cls()
             if sensor.available:
                 self.sensors[name] = sensor
                 self.readings[name] = {}
+            else:
+                self.pending[name] = (cls, interval)
 
-        if not self.sensors:
+        if not self.sensors and not self.pending:
             raise RuntimeError("no sensors available")
 
         Gio.bus_own_name(
@@ -358,12 +361,19 @@ class Daemon:
                 DBUS_PATH, iface_map[f"org.sensord.{name}"],
                 self._on_call, None, None,
             )
+        for name in self.pending:
+            conn.register_object(
+                DBUS_PATH, iface_map[f"org.sensord.{name}"],
+                self._on_call, None, None,
+            )
         print(f"sensord: {', '.join(self.sensors)}", file=sys.stderr)
+        if self.pending:
+            print(f"sensord: waiting: {', '.join(self.pending)}", file=sys.stderr)
 
     def _on_call(self, conn, sender, path, iface, method, params, invocation):
         name = iface.rsplit(".", 1)[-1]
-        if method == "GetReadings" and name in self.sensors:
-            invocation.return_value(GLib.Variant("(a{sd})", (self.readings[name],)))
+        if method == "GetReadings":
+            invocation.return_value(GLib.Variant("(a{sd})", (self.readings.get(name, {}),)))
         else:
             invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
 
@@ -380,9 +390,25 @@ class Daemon:
             return GLib.SOURCE_CONTINUE
         return tick
 
+    def _make_probe(self, name):
+        cls, interval = self.pending[name]
+        def probe():
+            sensor = cls()
+            if not sensor.available:
+                return GLib.SOURCE_CONTINUE
+            self.sensors[name] = sensor
+            self.readings[name] = {}
+            del self.pending[name]
+            print(f"sensord: late: {name}", file=sys.stderr)
+            GLib.timeout_add_seconds(interval, self._make_tick(name))
+            return GLib.SOURCE_REMOVE
+        return probe
+
     def run(self):
         for name in self.sensors:
             GLib.timeout_add_seconds(SENSORS[name][1], self._make_tick(name))
+        for name in list(self.pending):
+            GLib.timeout_add_seconds(self.pending[name][1], self._make_probe(name))
 
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 2, self.loop.quit)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, self.loop.quit)

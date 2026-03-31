@@ -1,5 +1,5 @@
 [Desktop Entry]
-Name=ScreenTime
+Name=Screentime Viewer
 Comment=View your screen time usage
 Exec=screentime-viewer
 Icon=preferences-system-time-symbolic

@@ -627,6 +627,7 @@ class BatteryWindow(Adw.ApplicationWindow):
         # merge adjacent sessions with same status and small gaps
         MERGE_GAP = 180  # 3 minutes — merge if same status and gap < this
         GAP_THRESHOLD = 180  # show gap row if gap >= this between different statuses
+        LVL_THRESHOLD = 0
 
         merged = []
         for s in sessions:

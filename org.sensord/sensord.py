@@ -12,6 +12,7 @@ Interfaces:
     org.sensord.Thermal   — hwmon temperatures (°C)
     org.sensord.Cpu       — per-core and total usage (%)
     org.sensord.Memory    — memory utilization (bytes/%)
+    org.sensord.Battery   — battery state (%/W/status)
 
 Each interface exposes:
     GetReadings() → a{sd}
@@ -60,6 +61,7 @@ INTROSPECTION = f"""
   {make_iface_xml("Thermal")}
   {make_iface_xml("Cpu")}
   {make_iface_xml("Memory")}
+  {make_iface_xml("Battery")}
 </node>
 """
 
@@ -317,6 +319,87 @@ class MemorySensor:
             os.close(self.fd)
 
 
+class BatterySensor:
+    """power_supply sysfs → battery state."""
+
+    PS_BASE = "/sys/class/power_supply"
+
+    # status string → numeric code for a{sd}
+    STATUS_MAP = {
+        "Charging": 1.0, "Discharging": 2.0,
+        "Not charging": 3.0, "Full": 4.0,
+    }
+
+    class Supply:
+        __slots__ = ("name", "path", "is_battery")
+
+        def __init__(self, name, path, is_battery):
+            self.name = name
+            self.path = path
+            self.is_battery = is_battery
+
+    def __init__(self):
+        self.supplies = []
+        if not os.path.isdir(self.PS_BASE):
+            return
+
+        for entry in sorted(os.listdir(self.PS_BASE)):
+            path = os.path.join(self.PS_BASE, entry)
+            ptype = self._read(path, "type")
+            if ptype == "Battery":
+                self.supplies.append(self.Supply(entry, path, True))
+                print(f"  battery: {entry}", file=sys.stderr)
+            elif ptype == "Mains":
+                self.supplies.append(self.Supply(entry, path, False))
+                print(f"  battery: {entry} (ac)", file=sys.stderr)
+
+    @staticmethod
+    def _read(path, name):
+        try:
+            with open(os.path.join(path, name)) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    @property
+    def available(self):
+        return any(s.is_battery for s in self.supplies)
+
+    def sample(self):
+        r = {}
+        for s in self.supplies:
+            if s.is_battery:
+                cap = self._read(s.path, "capacity")
+                if cap is not None:
+                    r[f"{s.name}/percent"] = float(cap)
+
+                status = self._read(s.path, "status")
+                if status is not None:
+                    r[f"{s.name}/status"] = self.STATUS_MAP.get(status, 0.0)
+
+                power = self._read(s.path, "power_now")
+                if power is not None:
+                    r[f"{s.name}/power"] = round(int(power) / 1e6, 2)
+
+                e_now = self._read(s.path, "energy_now")
+                e_full = self._read(s.path, "energy_full")
+                if e_now is not None and e_full is not None:
+                    r[f"{s.name}/energy_now"] = round(int(e_now) / 1e6, 2)
+                    r[f"{s.name}/energy_full"] = round(int(e_full) / 1e6, 2)
+
+                cycles = self._read(s.path, "cycle_count")
+                if cycles is not None:
+                    r[f"{s.name}/cycles"] = float(cycles)
+            else:
+                online = self._read(s.path, "online")
+                if online is not None:
+                    r[f"{s.name}/online"] = float(online)
+        return r
+
+    def close(self):
+        pass
+
+
 # ── daemon ────────────────────────────────────────────────────
 
 
@@ -325,6 +408,7 @@ SENSORS = {
     "Thermal": (ThermalSensor, 2),
     "Cpu":     (CpuSensor,     1),
     "Memory":  (MemorySensor,  2),
+    "Battery": (BatterySensor, 5),
 }
 
 

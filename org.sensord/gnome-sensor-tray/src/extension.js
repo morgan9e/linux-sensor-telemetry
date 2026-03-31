@@ -62,6 +62,33 @@ const CATEGORIES = {
         summaryKey: 'percent',
         sortOrder: 3,
     },
+    Battery: {
+        icon: ['battery-symbolic', 'battery-full-charged-symbolic', 'plug-symbolic'],
+        // status codes: 1=Charging, 2=Discharging, 3=Not charging, 4=Full
+        _statusNames: { 1: 'Charging', 2: 'Discharging', 3: 'Not charging', 4: 'Full' },
+        format: function (v, dec, _unit, key) {
+            if (key.endsWith('/percent'))
+                return (dec ? '%.1f' : '%.0f').format(v) + '%';
+            if (key.endsWith('/status'))
+                return this._statusNames[v] ?? 'Unknown';
+            if (key.endsWith('/power'))
+                return (dec ? '%.2f' : '%.1f').format(v) + ' W';
+            if (key.endsWith('/energy_now') || key.endsWith('/energy_full'))
+                return '%.1f Wh'.format(v);
+            if (key.endsWith('/cycles'))
+                return '%.0f'.format(v);
+            if (key.endsWith('/online'))
+                return v ? 'Yes' : 'No';
+            return (dec ? '%.2f' : '%.1f').format(v);
+        },
+        summary: (r) => {
+            for (let k of Object.keys(r))
+                if (k.endsWith('/percent')) return r[k];
+            return null;
+        },
+        summaryKey: 'percent',
+        sortOrder: 4,
+    },
 };
 
 const DEFAULT_CATEGORY = {

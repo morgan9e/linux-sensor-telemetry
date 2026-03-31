@@ -16,6 +16,7 @@ Interfaces:
 
 Each interface exposes:
     GetReadings() → a{sd}
+    GetMeta()     → a{sv}   (icon: s, units: a{ss})
     signal Changed(a{sd})
 
 Usage:
@@ -51,6 +52,7 @@ POLICY = """\
 def make_iface_xml(name):
     return f"""<interface name="org.sensord.{name}">
   <method name="GetReadings"><arg direction="out" type="a{{sd}}"/></method>
+  <method name="GetMeta"><arg direction="out" type="a{{sv}}"/></method>
   <signal name="Changed"><arg type="a{{sd}}"/></signal>
 </interface>"""
 
@@ -73,6 +75,7 @@ class PowerSensor:
     """RAPL energy counters → watts."""
 
     RAPL_BASE = "/sys/class/powercap/intel-rapl"
+    ICON = "battery-full-charged-symbolic"
 
     class Zone:
         __slots__ = ("name", "fd", "wrap", "prev_e", "prev_t")
@@ -119,7 +122,7 @@ class PowerSensor:
             if "energy_uj" in files:
                 try:
                     z = self.Zone(root)
-                    z.sample()  # prime
+                    z.sample()
                     self.zones.append(z)
                     print(f"  power: {z.name}", file=sys.stderr)
                 except OSError as e:
@@ -128,6 +131,9 @@ class PowerSensor:
     @property
     def available(self):
         return bool(self.zones)
+
+    def units(self):
+        return {z.name: "W" for z in self.zones}
 
     def sample(self):
         r = {}
@@ -146,6 +152,7 @@ class ThermalSensor:
     """hwmon temperature sensors → °C."""
 
     HWMON_BASE = "/sys/class/hwmon"
+    ICON = "sensors-temperature-symbolic"
 
     class Chip:
         __slots__ = ("label", "fd")
@@ -182,7 +189,7 @@ class ThermalSensor:
 
                 try:
                     chip = self.Chip(full_label, path)
-                    chip.read()  # test
+                    chip.read()
                     self.chips.append(chip)
                     print(f"  thermal: {full_label}", file=sys.stderr)
                 except OSError as e:
@@ -199,6 +206,9 @@ class ThermalSensor:
     @property
     def available(self):
         return bool(self.chips)
+
+    def units(self):
+        return {c.label: "°C" for c in self.chips}
 
     def sample(self):
         r = {}
@@ -217,13 +227,15 @@ class ThermalSensor:
 class CpuSensor:
     """/proc/stat → per-core and total CPU usage %."""
 
+    ICON = "utilities-system-monitor-symbolic"
+
     def __init__(self):
         self.fd = None
         self.prev = {}
 
         try:
             self.fd = os.open("/proc/stat", os.O_RDONLY)
-            self._read_stat()  # prime
+            self._read_stat()
             print(f"  cpu: {len(self.prev)} entries", file=sys.stderr)
         except OSError as e:
             print(f"  cpu skip: {e}", file=sys.stderr)
@@ -242,11 +254,17 @@ class CpuSensor:
             parts = line.split()
             name = parts[0]
             vals = [int(v) for v in parts[1:]]
-            # user nice system idle iowait irq softirq steal
             idle = vals[3] + vals[4] if len(vals) > 4 else vals[3]
             total = sum(vals)
             entries[name] = (idle, total)
         return entries
+
+    def units(self):
+        r = {}
+        for name in self.prev:
+            label = "total" if name == "cpu" else name
+            r[label] = "%"
+        return r
 
     def sample(self):
         cur = self._read_stat()
@@ -270,13 +288,14 @@ class CpuSensor:
 class MemorySensor:
     """/proc/meminfo → memory stats in bytes and usage %."""
 
+    ICON = "drive-harddisk-symbolic"
     KEYS = ("MemTotal", "MemAvailable", "MemFree", "SwapTotal", "SwapFree")
 
     def __init__(self):
         self.fd = None
         try:
             self.fd = os.open("/proc/meminfo", os.O_RDONLY)
-            self.sample()  # test
+            self.sample()
             print("  memory: ok", file=sys.stderr)
         except OSError as e:
             print(f"  memory skip: {e}", file=sys.stderr)
@@ -284,6 +303,13 @@ class MemorySensor:
     @property
     def available(self):
         return self.fd is not None
+
+    def units(self):
+        return {
+            "total": "bytes", "available": "bytes", "used": "bytes",
+            "percent": "%",
+            "swap_total": "bytes", "swap_used": "bytes", "swap_percent": "%",
+        }
 
     def sample(self):
         os.lseek(self.fd, 0, os.SEEK_SET)
@@ -294,7 +320,7 @@ class MemorySensor:
             parts = line.split()
             key = parts[0].rstrip(":")
             if key in self.KEYS:
-                vals[key] = int(parts[1]) * 1024  # kB → bytes
+                vals[key] = int(parts[1]) * 1024
 
         r = {}
         mt = vals.get("MemTotal", 0)
@@ -323,8 +349,8 @@ class BatterySensor:
     """power_supply sysfs → battery state."""
 
     PS_BASE = "/sys/class/power_supply"
+    ICON = "battery-symbolic"
 
-    # status string → numeric code for a{sd}
     STATUS_MAP = {
         "Charging": 1.0, "Discharging": 2.0,
         "Not charging": 3.0, "Full": 4.0,
@@ -365,6 +391,20 @@ class BatterySensor:
     def available(self):
         return any(s.is_battery for s in self.supplies)
 
+    def units(self):
+        r = {}
+        for s in self.supplies:
+            if s.is_battery:
+                r[f"{s.name}/percent"] = "%"
+                r[f"{s.name}/status"] = "enum:Charging,Discharging,Not charging,Full"
+                r[f"{s.name}/power"] = "W"
+                r[f"{s.name}/energy_now"] = "Wh"
+                r[f"{s.name}/energy_full"] = "Wh"
+                r[f"{s.name}/cycles"] = "count"
+            else:
+                r[f"{s.name}/online"] = "bool"
+        return r
+
     def sample(self):
         r = {}
         for s in self.supplies:
@@ -404,7 +444,7 @@ class BatterySensor:
 
 
 SENSORS = {
-    "Power":   (PowerSensor,   1),   # iface name, interval (sec)
+    "Power":   (PowerSensor,   1),
     "Thermal": (ThermalSensor, 2),
     "Cpu":     (CpuSensor,     1),
     "Memory":  (MemorySensor,  2),
@@ -416,9 +456,9 @@ class Daemon:
     def __init__(self):
         self.loop = GLib.MainLoop()
         self.bus = None
-        self.sensors = {}     # name → sensor instance
-        self.readings = {}    # name → latest {key: value}
-        self.pending = {}     # name → (cls, interval) — not yet available
+        self.sensors = {}
+        self.readings = {}
+        self.pending = {}
         self.node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
 
         for name, (cls, interval) in SENSORS.items():
@@ -458,6 +498,13 @@ class Daemon:
         name = iface.rsplit(".", 1)[-1]
         if method == "GetReadings":
             invocation.return_value(GLib.Variant("(a{sd})", (self.readings.get(name, {}),)))
+        elif method == "GetMeta":
+            meta = {}
+            sensor = self.sensors.get(name)
+            if sensor:
+                meta["icon"] = GLib.Variant("s", sensor.ICON)
+                meta["units"] = GLib.Variant("a{ss}", sensor.units())
+            invocation.return_value(GLib.Variant("(a{sv})", (meta,)))
         else:
             invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
 

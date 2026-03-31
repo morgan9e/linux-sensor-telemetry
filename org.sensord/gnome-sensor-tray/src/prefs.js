@@ -123,13 +123,6 @@ export default class SensorTrayPreferences extends ExtensionPreferences {
     _createDisplayGroup() {
         let group = new Adw.PreferencesGroup({ title: _('Display') });
 
-        let unitRow = new Adw.ComboRow({
-            title: _('Temperature Unit'),
-            model: new Gtk.StringList({ strings: ['\u00b0C', '\u00b0F'] }),
-        });
-        this._settings.bind('unit', unitRow, 'selected', Gio.SettingsBindFlags.DEFAULT);
-        group.add(unitRow);
-
         group.add(this._switch(_('Show Decimal Values'), 'show-decimal-value'));
         group.add(this._switch(_('Show Icon on Panel'), 'show-icon-on-panel'));
 

@@ -5,35 +5,18 @@ const BUS_NAME = 'org.sensord';
 const OBJECT_PATH = '/org/sensord';
 const IFACE_PREFIX = 'org.sensord.';
 
-/**
- * Generic client for all org.sensord.* D-Bus interfaces.
- *
- * Every interface has the same shape:
- *   method  GetReadings() → a{sd}
- *   signal  Changed(a{sd})
- *
- * The client introspects the object once, discovers all sensor interfaces,
- * fetches initial readings, then subscribes to Changed signals.
- * Callers get a flat Map<category, Map<key, double>> that stays current.
- */
 export default class SensorClient {
 
     constructor() {
         this._conn = null;
         this._signalIds = [];
-        // category → { key: value } e.g. "Power" → { "package-0": 42.3 }
         this._readings = new Map();
+        this._meta = new Map();
         this._onChanged = null;
         this._available = false;
         this._nameWatchId = 0;
     }
 
-    /**
-     * Connect to the system bus and start receiving sensor data.
-     * @param {function(string, Object<string,number>)} onChanged
-     *   Called with (category, readings) whenever a sensor interface emits Changed
-     *   and also once per interface after initial GetReadings.
-     */
     start(onChanged) {
         this._onChanged = onChanged;
 
@@ -44,7 +27,6 @@ export default class SensorClient {
             return;
         }
 
-        // Watch for sensord appearing/disappearing on the bus
         this._nameWatchId = Gio.bus_watch_name_on_connection(
             this._conn,
             BUS_NAME,
@@ -63,17 +45,15 @@ export default class SensorClient {
         this._available = false;
         this._unsubscribeAll();
         this._readings.clear();
+        this._meta.clear();
         if (this._onChanged)
-            this._onChanged(null, null); // signal "all gone"
+            this._onChanged(null, null);
     }
 
-    /**
-     * Introspect /org/sensord, find all org.sensord.* interfaces,
-     * call GetReadings on each, subscribe to Changed.
-     */
     _discover() {
         this._unsubscribeAll();
         this._readings.clear();
+        this._meta.clear();
 
         let introXml;
         try {
@@ -89,7 +69,6 @@ export default class SensorClient {
             return;
         }
 
-        // Parse interface names from XML — simple regex is fine here
         let ifaces = [];
         let re = /interface\s+name="(org\.sensord\.[^"]+)"/g;
         let m;
@@ -97,9 +76,8 @@ export default class SensorClient {
             ifaces.push(m[1]);
 
         for (let iface of ifaces) {
-            let category = iface.slice(IFACE_PREFIX.length); // "Power", "Thermal", etc.
+            let category = iface.slice(IFACE_PREFIX.length);
 
-            // Subscribe to Changed signal
             let sid = this._conn.signal_subscribe(
                 BUS_NAME, iface, 'Changed', OBJECT_PATH,
                 null, Gio.DBusSignalFlags.NONE,
@@ -112,7 +90,26 @@ export default class SensorClient {
             );
             this._signalIds.push(sid);
 
-            // Fetch initial state
+            this._conn.call(
+                BUS_NAME, OBJECT_PATH, iface, 'GetMeta',
+                null, GLib.VariantType.new('(a{sv})'),
+                Gio.DBusCallFlags.NONE, 3000, null,
+                (conn, res) => {
+                    try {
+                        let result = conn.call_finish(res);
+                        let [meta] = result.deep_unpack();
+                        let parsed = {};
+                        if (meta['icon'])
+                            parsed.icon = meta['icon'].deep_unpack();
+                        if (meta['units'])
+                            parsed.units = meta['units'].deep_unpack();
+                        this._meta.set(category, parsed);
+                    } catch (e) {
+                        console.debug(`sensortray: GetMeta(${iface}) unavailable:`, e.message);
+                    }
+                },
+            );
+
             this._conn.call(
                 BUS_NAME, OBJECT_PATH, iface, 'GetReadings',
                 null, GLib.VariantType.new('(a{sd})'),
@@ -140,18 +137,9 @@ export default class SensorClient {
         this._signalIds = [];
     }
 
-    /** @returns {boolean} true if sensord is on the bus */
-    get available() {
-        return this._available;
-    }
-
-    /**
-     * @returns {Map<string, Object<string,number>>}
-     * category → { key: value } snapshot of all current readings
-     */
-    get readings() {
-        return this._readings;
-    }
+    get available() { return this._available; }
+    get readings() { return this._readings; }
+    get meta() { return this._meta; }
 
     destroy() {
         this._unsubscribeAll();
@@ -162,5 +150,6 @@ export default class SensorClient {
         this._conn = null;
         this._onChanged = null;
         this._readings.clear();
+        this._meta.clear();
     }
 }

@@ -13,101 +13,67 @@ import {Extension, gettext as _} from 'resource:///org/gnome/shell/extensions/ex
 import SensorClient from './sensorClient.js';
 import SensorItem from './sensorItem.js';
 
-// ---------- helpers ----------
-
-// Gio.icon_new_for_string only takes one name; use ThemedIcon for fallbacks
 function safeIcon(names) {
     if (typeof names === 'string')
         names = [names];
     return new Gio.ThemedIcon({ names });
 }
 
-// ---------- category config ----------
+function formatByUnit(unit, val, dec) {
+    if (!unit)
+        return (dec ? '%.2f' : '%.1f').format(val);
 
-const CATEGORIES = {
-    Thermal: {
-        icon: ['sensors-temperature-symbolic', 'temperature-symbolic', 'dialog-warning-symbolic'],
-        format: (v, dec, unit) => {
-            if (unit === 1) v = v * 9 / 5 + 32;
-            return (dec ? '%.1f' : '%.0f').format(v) + (unit === 1 ? '\u00b0F' : '\u00b0C');
-        },
-        convert: (v, unit) => unit === 1 ? v * 9 / 5 + 32 : v,
-        summary: (r) => Math.max(...Object.values(r)),
-        sortOrder: 0,
-    },
-    Cpu: {
-        icon: ['utilities-system-monitor-symbolic', 'org.gnome.SystemMonitor-symbolic', 'computer-symbolic'],
-        format: (v, dec) => (dec ? '%.1f' : '%.0f').format(v) + '%',
-        summary: (r) => r['total'] ?? null,
-        sortOrder: 1,
-    },
-    Power: {
-        icon: ['battery-full-charged-symbolic', 'battery-symbolic', 'plug-symbolic'],
-        format: (v, dec) => (dec ? '%.2f' : '%.1f').format(v) + ' W',
-        summary: (r) => r['package-0'] ?? null,
-        sortOrder: 2,
-    },
-    Memory: {
-        icon: ['drive-harddisk-symbolic', 'media-memory-symbolic', 'computer-symbolic'],
-        format: (v, dec, _unit, key) => {
-            if (key === 'percent' || key === 'swap_percent')
-                return (dec ? '%.1f' : '%.0f').format(v) + '%';
-            if (v >= 1073741824)
-                return '%.1f GiB'.format(v / 1073741824);
-            if (v >= 1048576)
-                return '%.0f MiB'.format(v / 1048576);
-            return '%.0f KiB'.format(v / 1024);
-        },
-        summary: (r) => r['percent'] ?? null,
-        summaryKey: 'percent',
-        sortOrder: 3,
-    },
-    Battery: {
-        icon: ['battery-symbolic', 'battery-full-charged-symbolic', 'plug-symbolic'],
-        // status codes: 1=Charging, 2=Discharging, 3=Not charging, 4=Full
-        _statusNames: { 1: 'Charging', 2: 'Discharging', 3: 'Not charging', 4: 'Full' },
-        format: function (v, dec, _unit, key) {
-            if (key.endsWith('/percent'))
-                return (dec ? '%.1f' : '%.0f').format(v) + '%';
-            if (key.endsWith('/status'))
-                return this._statusNames[v] ?? 'Unknown';
-            if (key.endsWith('/power'))
-                return (dec ? '%.2f' : '%.1f').format(v) + ' W';
-            if (key.endsWith('/energy_now') || key.endsWith('/energy_full'))
-                return '%.1f Wh'.format(v);
-            if (key.endsWith('/cycles'))
-                return '%.0f'.format(v);
-            if (key.endsWith('/online'))
-                return v ? 'Yes' : 'No';
-            return (dec ? '%.2f' : '%.1f').format(v);
-        },
-        summary: (r) => {
-            for (let k of Object.keys(r))
-                if (k.endsWith('/percent')) return r[k];
-            return null;
-        },
-        summaryKey: 'percent',
-        sortOrder: 4,
-    },
-};
-
-const DEFAULT_CATEGORY = {
-    icon: ['dialog-information-symbolic'],
-    format: (v, dec) => (dec ? '%.2f' : '%.1f').format(v),
-    sortOrder: 99,
-};
-
-function catCfg(cat) {
-    return CATEGORIES[cat] || DEFAULT_CATEGORY;
+    switch (unit) {
+    case '%':
+        return (dec ? '%.1f' : '%.0f').format(val) + '%';
+    case 'W':
+        return (dec ? '%.2f' : '%.1f').format(val) + ' W';
+    case 'Wh':
+        return '%.1f Wh'.format(val);
+    case '\u00b0C':
+        return (dec ? '%.1f' : '%.0f').format(val) + '\u00b0C';
+    case 'bytes':
+        if (val >= 1073741824) return '%.1f GiB'.format(val / 1073741824);
+        if (val >= 1048576) return '%.0f MiB'.format(val / 1048576);
+        return '%.0f KiB'.format(val / 1024);
+    case 'count':
+        return '%.0f'.format(val);
+    case 'bool':
+        return val ? 'Yes' : 'No';
+    default:
+        if (unit.startsWith('enum:')) {
+            let names = unit.slice(5).split(',');
+            let idx = Math.round(val) - 1;
+            return (idx >= 0 && idx < names.length) ? names[idx] : 'Unknown';
+        }
+        return (dec ? '%.2f' : '%.1f').format(val) + ' ' + unit;
+    }
 }
 
-function formatSensor(cat, key, val, dec, unit) {
-    let cfg = catCfg(cat);
-    let v = cfg.convert ? cfg.convert(val, unit) : val;
-    return cfg.format(v, dec, unit, key);
+function autoSummary(readings, units) {
+    if (!readings || !units)
+        return null;
+    if ('total' in readings) return { key: 'total', val: readings['total'] };
+    if ('percent' in readings) return { key: 'percent', val: readings['percent'] };
+    for (let k of Object.keys(readings))
+        if (k.endsWith('/percent')) return { key: k, val: readings[k] };
+    let k = Object.keys(readings)[0];
+    return k ? { key: k, val: readings[k] } : null;
 }
 
-// ---------- panel button ----------
+const SORT_ORDER = { Thermal: 0, Cpu: 1, Power: 2, Memory: 3, Battery: 4 };
+
+function catIcon(cat, meta) {
+    let m = meta?.get(cat);
+    if (m?.icon)
+        return [m.icon, 'dialog-information-symbolic'];
+    return ['dialog-information-symbolic'];
+}
+
+function formatSensor(cat, key, val, dec, meta) {
+    let unit = meta?.get(cat)?.units?.[key] ?? null;
+    return formatByUnit(unit, val, dec);
+}
 
 class SensorTrayButton extends PanelMenu.Button {
 
@@ -122,31 +88,26 @@ class SensorTrayButton extends PanelMenu.Button {
         this._path = path;
         this._client = new SensorClient();
 
-        // menu state
-        this._subMenus = {};     // category → PopupSubMenuMenuItem
-        this._menuItems = {};    // fullKey → SensorItem
+        this._subMenus = {};
+        this._menuItems = {};
         this._lastKeys = null;
 
-        // panel state
         this._panelBox = new St.BoxLayout();
         this.add_child(this._panelBox);
-        this._hotLabels = {};    // fullKey → St.Label
-        this._hotIcons = {};     // fullKey → St.Icon
+        this._hotLabels = {};
+        this._hotIcons = {};
 
         this._buildPanel();
 
-        // settings
         this._sigIds = [];
         this._connectSetting('hot-sensors', () => { this._buildPanel(); this._updatePanel(); this._syncPinOrnaments(); });
         this._connectSetting('show-icon-on-panel', () => { this._buildPanel(); this._updatePanel(); });
         this._connectSetting('panel-spacing', () => { this._buildPanel(); this._updatePanel(); });
-        this._connectSetting('unit', () => this._refresh());
         this._connectSetting('show-decimal-value', () => this._refresh());
         this._connectSetting('position-in-panel', () => this._reposition());
         this._connectSetting('panel-box-index', () => this._reposition());
         this._connectSetting('update-interval', () => this._restartRefreshTimer());
 
-        // throttle UI repaints via a timer
         this._dirty = false;
         this._refreshTimerId = 0;
         this._startRefreshTimer();
@@ -166,8 +127,6 @@ class SensorTrayButton extends PanelMenu.Button {
         this._sigIds.push(this._settings.connect('changed::' + key, cb));
     }
 
-    // ---- panel (top bar): pinned sensors ----
-
     _buildPanel() {
         this._panelBox.destroy_all_children();
         this._hotLabels = {};
@@ -179,17 +138,17 @@ class SensorTrayButton extends PanelMenu.Button {
         if (hot.length === 0) {
             this._panelBox.add_child(new St.Icon({
                 style_class: 'system-status-icon',
-                gicon: safeIcon(CATEGORIES.Thermal.icon),
+                gicon: safeIcon(['sensors-temperature-symbolic', 'dialog-information-symbolic']),
             }));
             return;
         }
 
+        let meta = this._client.meta;
+
         for (let i = 0; i < hot.length; i++) {
             let fullKey = hot[i];
             let cat = fullKey.split('/')[0];
-            let cfg = catCfg(cat);
 
-            // spacer between pinned items
             if (i > 0) {
                 let spacing = this._settings.get_int('panel-spacing');
                 this._panelBox.add_child(new St.Widget({ width: spacing }));
@@ -198,7 +157,7 @@ class SensorTrayButton extends PanelMenu.Button {
             if (showIcon) {
                 let icon = new St.Icon({
                     style_class: 'system-status-icon',
-                    gicon: safeIcon(cfg.icon),
+                    gicon: safeIcon(catIcon(cat, meta)),
                 });
                 this._hotIcons[fullKey] = icon;
                 this._panelBox.add_child(icon);
@@ -217,7 +176,7 @@ class SensorTrayButton extends PanelMenu.Button {
 
     _updatePanel() {
         let dec = this._settings.get_boolean('show-decimal-value');
-        let unit = this._settings.get_int('unit');
+        let meta = this._client.meta;
 
         for (let [fullKey, label] of Object.entries(this._hotLabels)) {
             let parts = fullKey.split('/');
@@ -230,11 +189,9 @@ class SensorTrayButton extends PanelMenu.Button {
                 continue;
             }
 
-            label.text = formatSensor(cat, key, readings[key], dec, unit);
+            label.text = formatSensor(cat, key, readings[key], dec, meta);
         }
     }
-
-    // ---- dropdown: collapsed submenus per category ----
 
     _onSensorChanged(category, _readings) {
         if (category === null) {
@@ -276,9 +233,9 @@ class SensorTrayButton extends PanelMenu.Button {
     _sortedEntries() {
         let entries = [];
         for (let [cat, readings] of this._client.readings) {
-            let cfg = catCfg(cat);
+            let order = SORT_ORDER[cat] ?? 99;
             for (let key of Object.keys(readings))
-                entries.push({ cat, key, fullKey: cat + '/' + key, sortOrder: cfg.sortOrder });
+                entries.push({ cat, key, fullKey: cat + '/' + key, sortOrder: order });
         }
         entries.sort((a, b) => {
             if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
@@ -302,7 +259,6 @@ class SensorTrayButton extends PanelMenu.Button {
 
         let hot = this._settings.get_strv('hot-sensors');
 
-        // group by category
         let grouped = new Map();
         for (let e of entries) {
             if (!grouped.has(e.cat))
@@ -310,17 +266,18 @@ class SensorTrayButton extends PanelMenu.Button {
             grouped.get(e.cat).push(e);
         }
 
-        for (let [cat, catEntries] of grouped) {
-            let cfg = catCfg(cat);
+        let meta = this._client.meta;
 
-            // create a collapsed submenu for this category
+        for (let [cat, catEntries] of grouped) {
+            let iconNames = catIcon(cat, meta);
+
             let sub = new PopupMenu.PopupSubMenuMenuItem(cat, true);
-            sub.icon.gicon = safeIcon(cfg.icon);
+            sub.icon.gicon = safeIcon(iconNames);
             this._subMenus[cat] = sub;
             this.menu.addMenuItem(sub);
 
             for (let e of catEntries) {
-                let gicon = safeIcon(cfg.icon);
+                let gicon = safeIcon(iconNames);
                 let item = new SensorItem(gicon, e.fullKey, e.key, '\u2026');
 
                 if (hot.includes(e.fullKey))
@@ -333,7 +290,6 @@ class SensorTrayButton extends PanelMenu.Button {
             }
         }
 
-        // settings footer
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         let settingsItem = new PopupMenu.PopupMenuItem(_('Settings'));
         settingsItem.connect('activate', () => {
@@ -351,24 +307,22 @@ class SensorTrayButton extends PanelMenu.Button {
 
     _updateValues() {
         let dec = this._settings.get_boolean('show-decimal-value');
-        let unit = this._settings.get_int('unit');
+        let meta = this._client.meta;
 
         for (let [cat, readings] of this._client.readings) {
+            let units = meta.get(cat)?.units;
+
             for (let [key, val] of Object.entries(readings)) {
                 let item = this._menuItems[cat + '/' + key];
                 if (item)
-                    item.value = formatSensor(cat, key, val, dec, unit);
+                    item.value = formatSensor(cat, key, val, dec, meta);
             }
 
-            // update submenu header with a summary (e.g. max temp)
             let sub = this._subMenus[cat];
             if (sub && sub.status) {
-                let cfg = catCfg(cat);
-                if (cfg.summary) {
-                    let sv = cfg.summary(readings);
-                    if (sv !== null)
-                        sub.status.text = formatSensor(cat, cfg.summaryKey || '', sv, dec, unit);
-                }
+                let s = autoSummary(readings, units);
+                if (s)
+                    sub.status.text = formatByUnit(units?.[s.key], s.val, dec);
             }
         }
     }
@@ -397,8 +351,6 @@ class SensorTrayButton extends PanelMenu.Button {
         this._updatePanel();
     }
 
-    // ---- panel position ----
-
     _reposition() {
         try {
             if (!this.container?.get_parent()) return;
@@ -417,8 +369,6 @@ class SensorTrayButton extends PanelMenu.Button {
         }
     }
 
-    // ---- cleanup ----
-
     _onDestroy() {
         this._client.destroy();
         if (this._refreshTimerId) {
@@ -434,8 +384,6 @@ class SensorTrayButton extends PanelMenu.Button {
         this._sigIds = [];
     }
 }
-
-// ---------- extension entry point ----------
 
 export default class SensorTrayExtension extends Extension {
 

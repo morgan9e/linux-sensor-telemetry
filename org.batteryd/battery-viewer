@@ -63,6 +63,12 @@ class BatteryClient:
                         '(a(dddds))')
         return list(r[0]) if r else []
 
+    def get_events(self, date_str):
+        """Returns list of (ts, type_str)"""
+        r = self._call('GetEvents', GLib.Variant('(s)', (date_str,)),
+                        '(a(ds))')
+        return list(r[0]) if r else []
+
     def get_current(self):
         r = self._call('GetCurrent', None, '(dddds)')
         if r:
@@ -433,9 +439,10 @@ class SessionRow(Adw.ActionRow):
 
 
 class GapRow(Adw.ActionRow):
-    """Inferred gap between sessions (suspend/shutdown)."""
+    """Gap between sessions — labeled from events if available, otherwise inferred."""
 
-    def __init__(self, prev_end_ts, prev_end_level, next_start_ts, next_start_level):
+    def __init__(self, prev_end_ts, prev_end_level, next_start_ts, next_start_level,
+                 gap_event=None):
         super().__init__()
 
         t_start = datetime.fromtimestamp(prev_end_ts).strftime('%H:%M')
@@ -443,15 +450,27 @@ class GapRow(Adw.ActionRow):
         duration = next_start_ts - prev_end_ts
         delta = next_start_level - prev_end_level
 
-        if abs(delta) < 0.5:
-            kind = 'Shutdown / Hibernate'
+        if gap_event == 'suspend':
+            if delta > 0.5:
+                kind = 'Suspended (charged)'
+                icon = 'battery-level-50-charging-symbolic'
+            else:
+                kind = 'Suspended'
+                icon = 'media-playback-pause-symbolic'
+        elif gap_event == 'shutdown':
+            kind = 'Shutdown'
             icon = 'system-shutdown-symbolic'
-        elif delta > 0:
-            kind = 'Suspended (charged)'
-            icon = 'battery-level-50-charging-symbolic'
         else:
-            kind = 'Suspended'
-            icon = 'media-playback-pause-symbolic'
+            # fallback: infer from level delta
+            if abs(delta) < 0.5:
+                kind = 'Shutdown / Suspend'
+                icon = 'system-shutdown-symbolic'
+            elif delta > 0:
+                kind = 'Suspended (charged)'
+                icon = 'battery-level-50-charging-symbolic'
+            else:
+                kind = 'Suspended'
+                icon = 'media-playback-pause-symbolic'
 
         self.set_title(kind)
         self.set_subtitle(f'{t_start} – {t_end}  ·  {format_duration(duration)}')
@@ -596,6 +615,7 @@ class BatteryWindow(Adw.ApplicationWindow):
 
         samples = self.client.get_samples(date_str)
         sessions = self.client.get_sessions(date_str)
+        events = self.client.get_events(date_str)
         day_start = datetime.combine(
             self.current_date, datetime.min.time()).timestamp()
 
@@ -624,39 +644,53 @@ class BatteryWindow(Adw.ApplicationWindow):
         self.session_group.set_margin_top(16)
         self.content.append(self.session_group)
 
-        # merge adjacent sessions with same status and small gaps
-        MERGE_GAP = 180  # 3 minutes — merge if same status and gap < this
-        GAP_THRESHOLD = 180  # show gap row if gap >= this between different statuses
-        LVL_THRESHOLD = 0
+        MERGE_GAP = 180   # seconds — merge same-status if gap < this (not a real suspend)
+        GAP_THRESHOLD = 180  # show gap row if gap >= this
+        TRIVIAL_DUR = 300    # seconds — trivial if 0% change AND shorter than this
 
-        merged = []
+        # pass 1: drop trivial sessions (0% change + short duration)
+        filtered = []
         for s in sessions:
+            start_ts, end_ts, start_lvl, end_lvl, status = s
+            dur = end_ts - start_ts
+            if abs(end_lvl - start_lvl) < 0.5 and dur < TRIVIAL_DUR:
+                continue
+            filtered.append(s)
+
+        # pass 2: merge adjacent same-status sessions with small gaps
+        merged = []
+        for s in filtered:
             start_ts, end_ts, start_lvl, end_lvl, status = s
             if merged:
                 p_start, p_end, p_slvl, p_elvl, p_status = merged[-1]
                 gap = start_ts - p_end
                 if p_status == status and gap < MERGE_GAP:
-                    # extend previous session
                     merged[-1] = (p_start, end_ts, p_slvl, end_lvl, status)
                     continue
             merged.append(s)
 
+        def find_gap_event(gap_start, gap_end):
+            """Find a suspend or shutdown event within a gap period."""
+            for ts, etype in events:
+                if gap_start <= ts <= gap_end and etype in ('suspend', 'shutdown'):
+                    return etype
+            return None
+
         prev = None
         for s in merged:
             start_ts, end_ts, start_lvl, end_lvl, status = s
-            if end_ts - start_ts < 30:
-                prev = s
-                continue
 
             if prev is not None:
                 _, prev_end, _, prev_end_lvl, _ = prev
                 gap = start_ts - prev_end
                 if gap > GAP_THRESHOLD:
-                    gap_row = GapRow(prev_end, prev_end_lvl, start_ts, start_lvl)
-                    self.session_group.add(gap_row)
+                    gap_event = find_gap_event(prev_end, start_ts)
+                    self.session_group.add(
+                        GapRow(prev_end, prev_end_lvl, start_ts, start_lvl,
+                               gap_event))
 
-            row = SessionRow(start_ts, end_ts, start_lvl, end_lvl, status)
-            self.session_group.add(row)
+            self.session_group.add(
+                SessionRow(start_ts, end_ts, start_lvl, end_lvl, status))
             prev = s
 
         if not merged:

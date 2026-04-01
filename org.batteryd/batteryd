@@ -48,6 +48,10 @@ DBUS_IFACE_XML = '''<node>
       <arg direction="in" name="date" type="s"/>
       <arg direction="out" name="sessions" type="a(dddds)"/>
     </method>
+    <method name="GetEvents">
+      <arg direction="in" name="date" type="s"/>
+      <arg direction="out" name="events" type="a(ds)"/>
+    </method>
     <method name="GetCurrent">
       <arg direction="out" name="level" type="d"/>
       <arg direction="out" name="energy_wh" type="d"/>
@@ -131,6 +135,13 @@ def open_db():
         )
     ''')
     db.execute('CREATE INDEX IF NOT EXISTS idx_sessions_ts ON sessions (start_ts)')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS events (
+            ts   REAL NOT NULL,
+            type TEXT NOT NULL
+        )
+    ''')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts)')
 
     # migrations
     cols = {r[1] for r in db.execute('PRAGMA table_info(samples)')}
@@ -203,6 +214,11 @@ class Battery:
             (self.session_start_ts, end_ts,
              self.session_start_level, end_level, status))
 
+    def _log_event(self, event_type):
+        now = time.time()
+        self.db.execute('INSERT INTO events (ts, type) VALUES (?, ?)',
+                        (now, event_type))
+
     def on_suspend(self):
         reading = read_battery(self.sys_bus, self.bat_path)
         if reading:
@@ -210,6 +226,7 @@ class Battery:
         now = time.time()
         if self.current and self.last_state is not None:
             self._close_session(now, self.current['level'])
+        self._log_event('suspend')
         self.flush()
         self.session_start_ts = 0
         self.last_state = None
@@ -217,6 +234,7 @@ class Battery:
                    self.current['level'] if self.current else 0)
 
     def on_resume(self):
+        self._log_event('resume')
         reading = read_battery(self.sys_bus, self.bat_path)
         if reading is None:
             return
@@ -249,6 +267,7 @@ class Battery:
     def shutdown(self):
         if self.current and self.last_state is not None:
             self._close_session(time.time(), self.current['level'])
+        self._log_event('shutdown')
         self.flush()
         self.db.commit()
 
@@ -270,6 +289,7 @@ class Battery:
                       reading['power_w'], reading['voltage_v'],
                       STATE_NAMES.get(reading['state'], '?'))
 
+        self._log_event('start')
         self.flush_timer_id = GLib.timeout_add_seconds(
             FLUSH_INTERVAL, self._on_flush_timer)
 
@@ -306,6 +326,15 @@ class Battery:
 
         return [(float(s), float(e), float(sl), float(el), st)
                 for s, e, sl, el, st in rows]
+
+    def query_events(self, date_str):
+        day_start, day_end = _local_day_range(date_str)
+        rows = self.db.execute('''
+            SELECT ts, type FROM events
+            WHERE ts >= ? AND ts < ?
+            ORDER BY ts
+        ''', (day_start, day_end)).fetchall()
+        return [(float(ts), t) for ts, t in rows]
 
 def main():
     logging.basicConfig(
@@ -355,6 +384,9 @@ def main():
             elif method == 'GetSessions':
                 rows = tracker.query_sessions(params.unpack()[0])
                 invocation.return_value(GLib.Variant('(a(dddds))', (rows,)))
+            elif method == 'GetEvents':
+                rows = tracker.query_events(params.unpack()[0])
+                invocation.return_value(GLib.Variant('(a(ds))', (rows,)))
             elif method == 'GetCurrent':
                 if tracker.current:
                     r = tracker.current

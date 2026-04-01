@@ -104,12 +104,13 @@ def _day_range(date):
 
 
 def _query_db(db, table, date):
+    day_start, day_end = _day_range(date)
     return db.execute(f'''
         SELECT app_id, start_ts, end_ts
         FROM {table}
-        WHERE end_ts > unixepoch(:date)
-          AND start_ts < unixepoch(:date, '+1 day')
-    ''', {'date': date}).fetchall()
+        WHERE end_ts > :start
+          AND start_ts < :end
+    ''', {'start': day_start, 'end': day_end}).fetchall()
 
 
 def _aggregate_daily(sessions, day_start, day_end):

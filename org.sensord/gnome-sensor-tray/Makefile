@@ -4,14 +4,14 @@ INSTALL_DIR = $(HOME)/.local/share/gnome-shell/extensions/$(UUID)
 
 .PHONY: all schemas install uninstall zip clean test
 
+install: schemas
+	rm -rf $(INSTALL_DIR)
+	cp -r ./$(SRC) $(INSTALL_DIR)
+
 all: schemas
 
 schemas:
 	glib-compile-schemas $(SRC)/schemas/
-
-install: schemas
-	rm -rf $(INSTALL_DIR)
-	cp -r ./$(SRC) $(INSTALL_DIR)
 
 uninstall:
 	rm -rf $(INSTALL_DIR)

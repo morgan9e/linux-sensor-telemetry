@@ -346,7 +346,16 @@ class MemorySensor:
 
 
 class BatterySensor:
-    """power_supply sysfs → battery state."""
+    """power_supply sysfs → battery state.
+
+    Handles both energy-based (energy_*_uWh) and charge-based
+    (charge_*_uAh) batteries.  Voltage/current/power/energy are
+    derived from whatever sysfs exposes:
+
+        power   = power_now          else  |voltage * current|
+        energy  = energy_now         else  charge_now * V_design
+        health  = full / full_design (capacity retained vs. new)
+    """
 
     PS_BASE = "/sys/class/power_supply"
     ICON = "battery-symbolic"
@@ -357,12 +366,13 @@ class BatterySensor:
     }
 
     class Supply:
-        __slots__ = ("name", "path", "is_battery")
+        __slots__ = ("name", "path", "is_battery", "v_design")
 
-        def __init__(self, name, path, is_battery):
+        def __init__(self, name, path, is_battery, v_design=0.0):
             self.name = name
             self.path = path
             self.is_battery = is_battery
+            self.v_design = v_design  # volts, for charge→energy conversion
 
     def __init__(self):
         self.supplies = []
@@ -373,11 +383,13 @@ class BatterySensor:
             path = os.path.join(self.PS_BASE, entry)
             ptype = self._read(path, "type")
             if ptype == "Battery":
-                self.supplies.append(self.Supply(entry, path, True))
+                vd = self._micro(path, "voltage_min_design") or \
+                    self._micro(path, "voltage_now") or 0.0
+                self.supplies.append(self.Supply(entry, path, True, vd))
                 print(f"  battery: {entry}", file=sys.stderr)
-            elif ptype == "Mains":
+            elif ptype in ("Mains", "USB"):
                 self.supplies.append(self.Supply(entry, path, False))
-                print(f"  battery: {entry} (ac)", file=sys.stderr)
+                print(f"  battery: {entry} (line)", file=sys.stderr)
 
     @staticmethod
     def _read(path, name):
@@ -387,6 +399,16 @@ class BatterySensor:
         except OSError:
             return None
 
+    def _micro(self, path, name):
+        """Read a sysfs micro-unit (uV/uA/uW/uWh/uAh) → base unit float."""
+        v = self._read(path, name)
+        if v is None:
+            return None
+        try:
+            return int(v) / 1e6
+        except ValueError:
+            return None
+
     @property
     def available(self):
         return any(s.is_battery for s in self.supplies)
@@ -394,46 +416,112 @@ class BatterySensor:
     def units(self):
         r = {}
         for s in self.supplies:
-            if s.is_battery:
-                r[f"{s.name}/percent"] = "%"
-                r[f"{s.name}/status"] = "enum:Charging,Discharging,Not charging,Full"
-                r[f"{s.name}/power"] = "W"
-                r[f"{s.name}/energy_now"] = "Wh"
-                r[f"{s.name}/energy_full"] = "Wh"
-                r[f"{s.name}/cycles"] = "count"
-            else:
-                r[f"{s.name}/online"] = "bool"
+            n = s.name
+            if not s.is_battery:
+                r[f"{n}/online"] = "bool"
+                if self._read(s.path, "voltage_now") is not None:
+                    r[f"{n}/voltage"] = "V"
+                if self._read(s.path, "current_now") is not None:
+                    r[f"{n}/current"] = "A"
+                continue
+
+            r[f"{n}/percent"] = "%"
+            r[f"{n}/status"] = "enum:Charging,Discharging,Not charging,Full"
+            if self._read(s.path, "voltage_now") is not None:
+                r[f"{n}/voltage"] = "V"
+            if self._read(s.path, "current_now") is not None:
+                r[f"{n}/current"] = "A"
+            r[f"{n}/power"] = "W"
+            if self._read(s.path, "charge_now") is not None:
+                r[f"{n}/charge_now"] = "Ah"
+                r[f"{n}/charge_full"] = "Ah"
+                r[f"{n}/charge_design"] = "Ah"
+            r[f"{n}/energy_now"] = "Wh"
+            r[f"{n}/energy_full"] = "Wh"
+            r[f"{n}/energy_design"] = "Wh"
+            r[f"{n}/health"] = "%"
+            if self._read(s.path, "cycle_count") is not None:
+                r[f"{n}/cycles"] = "count"
         return r
+
+    def _sample_battery(self, s, r):
+        n = s.name
+
+        cap = self._read(s.path, "capacity")
+        if cap is not None:
+            r[f"{n}/percent"] = float(cap)
+
+        status = self._read(s.path, "status")
+        if status is not None:
+            r[f"{n}/status"] = self.STATUS_MAP.get(status, 0.0)
+
+        volt = self._micro(s.path, "voltage_now")
+        curr = self._micro(s.path, "current_now")
+        if volt is not None:
+            r[f"{n}/voltage"] = round(volt, 3)
+        if curr is not None:
+            r[f"{n}/current"] = round(curr, 3)
+
+        # power: prefer the chip's own reading, else V * I
+        power = self._micro(s.path, "power_now")
+        if power is None and volt is not None and curr is not None:
+            power = volt * curr
+        if power is not None:
+            r[f"{n}/power"] = round(abs(power), 2)
+
+        # charge capacity (uAh batteries)
+        c_now = self._micro(s.path, "charge_now")
+        c_full = self._micro(s.path, "charge_full")
+        c_design = self._micro(s.path, "charge_full_design")
+        if c_now is not None:
+            r[f"{n}/charge_now"] = round(c_now, 4)
+        if c_full is not None:
+            r[f"{n}/charge_full"] = round(c_full, 4)
+        if c_design is not None:
+            r[f"{n}/charge_design"] = round(c_design, 4)
+
+        # energy: prefer energy_* sysfs, else derive charge * V_design
+        e_now = self._micro(s.path, "energy_now")
+        e_full = self._micro(s.path, "energy_full")
+        e_design = self._micro(s.path, "energy_full_design")
+        if e_now is None and c_now is not None:
+            e_now = c_now * s.v_design
+        if e_full is None and c_full is not None:
+            e_full = c_full * s.v_design
+        if e_design is None and c_design is not None:
+            e_design = c_design * s.v_design
+        if e_now is not None:
+            r[f"{n}/energy_now"] = round(e_now, 2)
+        if e_full is not None:
+            r[f"{n}/energy_full"] = round(e_full, 2)
+        if e_design is not None:
+            r[f"{n}/energy_design"] = round(e_design, 2)
+
+        # health: capacity retained relative to factory design
+        full = c_full if c_full is not None else e_full
+        design = c_design if c_design is not None else e_design
+        if full is not None and design:
+            r[f"{n}/health"] = round(100.0 * full / design, 1)
+
+        cycles = self._read(s.path, "cycle_count")
+        if cycles is not None:
+            r[f"{n}/cycles"] = float(cycles)
 
     def sample(self):
         r = {}
         for s in self.supplies:
             if s.is_battery:
-                cap = self._read(s.path, "capacity")
-                if cap is not None:
-                    r[f"{s.name}/percent"] = float(cap)
-
-                status = self._read(s.path, "status")
-                if status is not None:
-                    r[f"{s.name}/status"] = self.STATUS_MAP.get(status, 0.0)
-
-                power = self._read(s.path, "power_now")
-                if power is not None:
-                    r[f"{s.name}/power"] = round(int(power) / 1e6, 2)
-
-                e_now = self._read(s.path, "energy_now")
-                e_full = self._read(s.path, "energy_full")
-                if e_now is not None and e_full is not None:
-                    r[f"{s.name}/energy_now"] = round(int(e_now) / 1e6, 2)
-                    r[f"{s.name}/energy_full"] = round(int(e_full) / 1e6, 2)
-
-                cycles = self._read(s.path, "cycle_count")
-                if cycles is not None:
-                    r[f"{s.name}/cycles"] = float(cycles)
+                self._sample_battery(s, r)
             else:
                 online = self._read(s.path, "online")
                 if online is not None:
                     r[f"{s.name}/online"] = float(online)
+                volt = self._micro(s.path, "voltage_now")
+                curr = self._micro(s.path, "current_now")
+                if volt is not None:
+                    r[f"{s.name}/voltage"] = round(volt, 3)
+                if curr is not None:
+                    r[f"{s.name}/current"] = round(curr, 3)
         return r
 
     def close(self):

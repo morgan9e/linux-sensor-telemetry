@@ -30,6 +30,12 @@ function formatByUnit(unit, val, dec) {
         return (dec ? '%.2f' : '%.1f').format(val) + ' W';
     case 'Wh':
         return '%.1f Wh'.format(val);
+    case 'V':
+        return '%.2f V'.format(val);
+    case 'A':
+        return '%.2f A'.format(val);
+    case 'Ah':
+        return '%.2f Ah'.format(val);
     case '\u00b0C':
         return (dec ? '%.1f' : '%.0f').format(val) + '\u00b0C';
     case 'bytes':
